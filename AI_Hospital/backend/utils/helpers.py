@@ -676,234 +676,179 @@ class OCRDataset(Dataset):
         
         return image, label
 
-class CRNN(nn.Module):
+class AttentionOCR(nn.Module):
     """
-    Convolutional Recurrent Neural Network for OCR.
+    OCR model with attention mechanism for better text recognition.
     """
-    def __init__(self, 
-                 num_classes: int,
-                 hidden_size: int = 256,
-                 num_layers: int = 2):
-        super(CRNN, self).__init__()
+    def __init__(self, num_classes: int, hidden_size: int = 256):
+        super(AttentionOCR, self).__init__()
         
-        # CNN layers
+        # CNN backbone
         self.cnn = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2)
+            nn.Conv2d(3, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.Conv2d(256, 256, 3, padding=1), nn.ReLU(), nn.MaxPool2d((2, 1)),
+            nn.Conv2d(256, 512, 3, padding=1), nn.BatchNorm2d(512), nn.ReLU(),
+            nn.Conv2d(512, 512, 3, padding=1), nn.ReLU(), nn.MaxPool2d((2, 1)),
+            nn.Conv2d(512, hidden_size, 2, 1, 0), nn.ReLU()
         )
         
-        # RNN layers
-        self.rnn = nn.LSTM(
-            input_size=512 * 2,  # Adjust based on your input image size
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            bidirectional=True,
-            batch_first=True
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
         )
         
-        # Output layer
-        self.fc = nn.Linear(hidden_size * 2, num_classes)
+        # Decoder
+        self.decoder = nn.LSTM(hidden_size, hidden_size, bidirectional=True, batch_first=True)
+        self.classifier = nn.Linear(hidden_size * 2, num_classes)
         
     def forward(self, x):
-        # CNN
-        conv = self.cnn(x)
-        batch, channel, height, width = conv.size()
+        # CNN feature extraction
+        conv = self.cnn(x)  # [batch, hidden, H, W]
+        b, c, h, w = conv.size()
+        conv = conv.view(b, c, -1).permute(0, 2, 1)  # [batch, H*W, hidden]
         
-        # Reshape for RNN
-        conv = conv.view(batch, channel * height, width)
-        conv = conv.permute(0, 2, 1)
+        # Attention weights
+        attn_weights = self.attention(conv)  # [batch, H*W, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)
         
-        # RNN
-        rnn, _ = self.rnn(conv)
+        # Apply attention
+        context = torch.bmm(attn_weights.transpose(1, 2), conv)  # [batch, 1, hidden]
+        context = context.squeeze(1)  # [batch, hidden]
         
-        # Output
-        output = self.fc(rnn)
+        # Decode
+        output, _ = self.decoder(context.unsqueeze(1))
+        output = self.classifier(output)
+        
         return output
 
-def train_ocr_model(model: nn.Module,
-                    train_loader: DataLoader,
-                    num_epochs: int = 10,
-                    learning_rate: float = 0.001,
-                    device: str = 'cuda') -> Dict[str, List[float]]:
+def preprocess_ocr_image(image: np.ndarray,
+                        target_height: int = 32,
+                        target_width: int = 128) -> np.ndarray:
     """
-    Train the OCR model.
+    Preprocess image specifically for OCR.
     
     Args:
-        model (nn.Module): OCR model
-        train_loader (DataLoader): Training data loader
-        num_epochs (int): Number of epochs
-        learning_rate (float): Learning rate
-        device (str): Device to train on
+        image (np.ndarray): Input image
+        target_height (int): Target height for resizing
+        target_width (int): Target width for resizing
         
     Returns:
-        Dict[str, List[float]]: Training history
+        np.ndarray: Preprocessed image
     """
-    model = model.to(device)
-    criterion = nn.CTCLoss(blank=0, zero_infinity=True)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
-    history = {'loss': [], 'accuracy': []}
-    
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        correct = 0
-        total = 0
-        
-        for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-            
-            # Calculate accuracy
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-        
-        epoch_loss = epoch_loss / len(train_loader)
-        accuracy = 100 * correct / total
-        
-        history['loss'].append(epoch_loss)
-        history['accuracy'].append(accuracy)
-        
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {accuracy:.2f}%')
-    
-    return history
-
-def get_ocr_transforms(train: bool = True) -> transforms.Compose:
-    """
-    Get data transforms for OCR training/inference.
-    
-    Args:
-        train (bool): Whether to use training transforms
-        
-    Returns:
-        transforms.Compose: Image transforms
-    """
-    if train:
-        transform = A.Compose([
-            A.RandomBrightnessContrast(p=0.5),
-            A.GaussNoise(p=0.3),
-            A.ElasticTransform(p=0.3),
-            A.Normalize(mean=[0.485, 0.456, 0.406], 
-                       std=[0.229, 0.224, 0.225]),
-            ToTensorV2()
-        ])
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     else:
-        transform = A.Compose([
-            A.Normalize(mean=[0.485, 0.456, 0.406], 
-                       std=[0.229, 0.224, 0.225]),
-            ToTensorV2()
-        ])
+        gray = image
     
-    return transform
+    # Denoise
+    denoised = cv2.fastNlMeansDenoising(gray)
+    
+    # Adaptive thresholding
+    binary = cv2.adaptiveThreshold(
+        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+    )
+    
+    # Deskew
+    coords = np.column_stack(np.where(binary > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = 90 + angle
+    (h, w) = binary.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(binary, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    
+    # Resize
+    resized = cv2.resize(rotated, (target_width, target_height))
+    
+    # Convert back to RGB and normalize
+    rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
+    normalized = rgb.astype(np.float32) / 255.0
+    
+    return normalized
 
-def predict_text(model: nn.Module,
-                image: np.ndarray,
-                device: str = 'cuda') -> str:
+def evaluate_ocr_model(model: nn.Module,
+                      test_loader: DataLoader,
+                      char_map: Dict[int, str],
+                      device: str = 'cuda') -> Dict[str, float]:
     """
-    Predict text from image using trained OCR model.
+    Evaluate OCR model performance.
     
     Args:
         model (nn.Module): Trained OCR model
-        image (np.ndarray): Input image
-        device (str): Device to run inference on
+        test_loader (DataLoader): Test data loader
+        char_map (Dict[int, str]): Character mapping dictionary
+        device (str): Device to run evaluation on
         
     Returns:
-        str: Predicted text
+        Dict[str, float]: Evaluation metrics
     """
     model.eval()
-    transform = get_ocr_transforms(train=False)
-    
-    # Preprocess image
-    image = transform(image=image)['image']
-    image = image.unsqueeze(0).to(device)
+    total_cer = 0.0
+    total_wer = 0.0
+    total_samples = 0
     
     with torch.no_grad():
-        outputs = model(image)
-        _, predicted = torch.max(outputs.data, 1)
-        
-    # Convert predictions to text
-    # You'll need to implement this based on your character mapping
-    text = decode_predictions(predicted)
+        for images, labels in test_loader:
+            images = images.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            
+            # Convert predictions to text
+            pred_texts = [decode_predictions(pred, char_map) for pred in predicted]
+            true_texts = [label for label in labels]
+            
+            # Calculate metrics
+            for pred_text, true_text in zip(pred_texts, true_texts):
+                # Character Error Rate
+                cer = levenshtein_distance(pred_text, true_text) / len(true_text)
+                total_cer += cer
+                
+                # Word Error Rate
+                pred_words = pred_text.split()
+                true_words = true_text.split()
+                wer = levenshtein_distance(pred_words, true_words) / len(true_words)
+                total_wer += wer
+                
+                total_samples += 1
     
-    return text
+    metrics = {
+        'character_error_rate': total_cer / total_samples,
+        'word_error_rate': total_wer / total_samples
+    }
+    
+    return metrics
 
-def decode_predictions(predictions: torch.Tensor,
-                      char_map: Dict[int, str]) -> str:
+def levenshtein_distance(s1: Union[str, List], s2: Union[str, List]) -> int:
     """
-    Decode model predictions to text.
+    Calculate Levenshtein distance between two sequences.
     
     Args:
-        predictions (torch.Tensor): Model predictions
-        char_map (Dict[int, str]): Character mapping dictionary
+        s1 (Union[str, List]): First sequence
+        s2 (Union[str, List]): Second sequence
         
     Returns:
-        str: Decoded text
+        int: Levenshtein distance
     """
-    text = ''
-    prev_char = None
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
     
-    for pred in predictions:
-        char = char_map[pred.item()]
-        if char != prev_char and char != '<blank>':
-            text += char
-        prev_char = char
+    if len(s2) == 0:
+        return len(s1)
     
-    return text
-
-def create_char_map(vocabulary: str) -> Tuple[Dict[str, int], Dict[int, str]]:
-    """
-    Create character mapping dictionaries.
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
     
-    Args:
-        vocabulary (str): String containing all possible characters
-        
-    Returns:
-        Tuple[Dict[str, int], Dict[int, str]]: Character to index and index to character mappings
-    """
-    char_to_idx = {'<blank>': 0}
-    idx_to_char = {0: '<blank>'}
-    
-    for i, char in enumerate(vocabulary, 1):
-        char_to_idx[char] = i
-        idx_to_char[i] = char
-    
-    return char_to_idx, idx_to_char
-
-def prepare_ocr_data(image_paths: List[str],
-                     labels: List[str],
-                     char_map: Dict[str, int],
-                     batch_size: int = 32) -> DataLoader:
-    """
-    Prepare data for OCR training.
-    
-    Args:
-        image_paths (List[str]): List of image paths
-        labels (List[str]): List of text labels
-        char_map (Dict[str, int]): Character mapping dictionary
-        batch_size (int): Batch size
-        
-    Returns:
-        DataLoader: Data loader for training
-    """
-    transform = get_ocr_transforms(train=True)
-    dataset = OCRDataset(image_paths, labels, transform)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    return previous_row[-1]
