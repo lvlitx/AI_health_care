@@ -159,20 +159,7 @@ def remove_stopwords(text: str) -> str:
     filtered_tokens = [token for token in tokens if token.lower() not in stop_words]
     return ' '.join(filtered_tokens)
 
-def save_image(image: np.ndarray, output_path: str) -> None:
-    """
-    Save image to disk.
-    
-    Args:
-        image (np.ndarray): Image to save
-        output_path (str): Path where to save the image
-    """
-    # Ensure the output directory exists
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
-    # Convert to PIL Image and save
-    image = Image.fromarray((image * 255).astype(np.uint8))
-    image.save(output_path)
+
 
 def load_image(image_path: str) -> np.ndarray:
     """
